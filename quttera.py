@@ -40,7 +40,7 @@ def handler(q=False):
 	
     q = json.loads(q)
 	
-    key = q["config"]["VTapikey"]
+    #key = q["config"]["VTapikey"]
 
     r = {"results": []}
 
