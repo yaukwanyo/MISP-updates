@@ -28,7 +28,7 @@ moduleinfo = {'version': '1', 'author': 'SSKYAU@OGCIO',
               'module-type': ['expansion']}
 
 # config fields that your code expects from the site admin
-moduleconfig = ["VTapikey"]
+#moduleconfig = ["VTapikey"]
 
 def init(url,key):
     return PyMISP(url,key, False, 'json')
@@ -190,5 +190,5 @@ def introspection():
 
 
 def version():
-    moduleinfo['config'] = moduleconfig
+    #moduleinfo['config'] = moduleconfig
     return moduleinfo
