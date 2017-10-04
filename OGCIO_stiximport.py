@@ -1,5 +1,6 @@
 import json
 import base64
+import re
 import requests
 import time
 import os
@@ -12,14 +13,14 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-from socket import *
+import socket
 
 misperrors = {'error': 'Error'}
 userConfig = {}
 inputSource = ['file']
 
-moduleinfo = {'version': '0.2', 'author': 'SK',
-              'description': 'Import some stix stuff',
+moduleinfo = {'version': '1.0', 'author': 'SEC21',
+              'description': 'Import stix and get IOC scan results',
               'module-type': ['import']}
 
 moduleconfig = ["VTapikey"]
@@ -29,10 +30,6 @@ def handler(q=False):
     # Just in case we have no data
     if q is False:
         return False
-
-    #Get Virustotal API key
-    key = request.get("config", {"VTapikey": ""})
-    key = key["VTapikey"]   	
 	
     # The return value
     r = OrderedDict()
@@ -42,6 +39,11 @@ def handler(q=False):
     # Load up that JSON
     q = json.loads(q)
 
+    # Get virustotal api key
+    key = q["config"]["VTapikey"]
+    MISPurl = q["config"]["MISPurl"]
+    MISPkey = q["config"]["MISPkey"]   
+
     # It's b64 encoded, so decode that stuff
     package = base64.b64decode(q.get("data")).decode('utf-8')
 
@@ -50,221 +52,253 @@ def handler(q=False):
         return json.dumps({"success": 0})
 
     pkg = stix.load_stix(package)
+
     for attrib in pkg.attributes:
 
+        #If it's a md5, scan with virustotal API
         if "md5" in attrib.type:
             md5 = attrib.value
             
             VTAPIresult = vtAPIscan(md5,key)
             r["results"].append({"values": [attrib.value], "types": [attrib.type], "categories": [attrib.category], "comment": VTAPIresult })
-			    
+
+        #If it's domain or url, perform webcrawling			    
         elif "url" in attrib.type or "ip-dst" in attrib.type or "domain" in attrib.type:
             url = attrib.value
-            vt = virustotal(url)
-            quttera = Quttera(url)
-            sucuri = Sucuri(url)
-            port80 = portScan(url, 80)
-            port443 = portScan(url, 443)
-            comment = CombineScans(vt,quttera,sucuri,port80,port443)
+            # If the url contains directory or filename, remove them and create a new attribute
+            if url.find("/", 8) > 0:
+                pos = url.find("/", 8)
+                print(pos)
+                newURL = url[:pos]
+                comment = scanURL(newURL)
+                r["results"].append({"values":[newURL], "types":[attrib.type], "categories": [attrib.category], "comment": comment })
+            comment = scanURL(url)
             r["results"].append({"values": [attrib.value], "types": [attrib.type], "categories": [attrib.category], "comment": comment })
 			
         else:
             r["results"].append({"values": [attrib.value], "types": [attrib.type], "categories": [attrib.category], "comment": " "})
     return r
 
+# Web crawling
+def scanURL(url):
+    vt = virustotal(url)
+    quttera = Quttera(url)
+    sucuri = Sucuri(url)
+    port80 = portScan(url, 80)
+    port443 = portScan(url, 443)
+    comment = CombineScans(vt, quttera, sucuri, port80, port443)
+    return comment
+
+# Start browser
 def startBrowsing():
     display = Display(visible=0, size=(800,600))
     display.start()
     driver = webdriver.Chrome()
+    driver.set_page_load_timeout(40)
     return driver
-	
-def portScan(url,portNo):
-    s = socket(AF_INET, SOCK_STREAM)
-    s.settimeout(2)
-    print("Scanning " + url + ": Port " + portNo + "...")
-    result = s.connect_ex((url, portNo))
-    if result == 0:
+
+# Scan ports using yougetsignal's api
+def portScan(url, portNo):
+    params = {"remoteAddress": url, "portNumber": portNo}
+    print("Scanning " + url + "Port " + str(portNo) + "...")
+    r = requests.post("https://ports.yougetsignal.com/check-port.php", params)
+    page = r.text
+    print(page)
+    if "/img/flag_green.gif" in page:
         status = "Open"
-    else:
+    elif "/img/flag_red.gif" in page:
         status = "Close"
-    s.close()
+    else:
+        status = "Invalid URL"
+    print(str(portNo) + ": " +status)
     return status
 
+#Combine scan results
 def CombineScans(vt, quttera, sucuri, port80, port443):
+    toReturn = ""
     toReturn = "Virustotal \r\nDetection Ratio: " + vt +\
-               "Quttera \r\nResult: \r\n" + quttera +\
-               sucuri +\
-               "Port Status \r\nPort 80: " + port80 + " \r\nPort 443: " + port443 
+               " \r\nQuttera \r\nResult: \r\n" + quttera +\
+               " \r\n " + sucuri +\
+               " \r\nPort Status \r\nPort 80: \n" + port80 + " \r\nPort 443: \n" + port443 
     return toReturn
-	
+
+#Crawl sucuri	
 def Sucuri(url):
 
     driver = startBrowsing()
-    driver.get("https://sitecheck.sucuri.net/results/" + url)
+    try:
+        driver.get("https://sitecheck.sucuri.net/results/" + url)
+    except TimeoutException:
+        return "Sucuri \r\n Status: N/A \r\n Web Trust: N/A"
 
     print("Scanning " + url + " on Sucuri...")
     results = driver.find_elements_by_tag_name("td")
 
-    #Get Status
-    endPos = results[3].text.find('"', 2)
-    status = results[3].text[:endPos]
+    try:
+        #Get status
+        endPos = results[3].text.find('"', 2)
+        status = results[3].text[:endPos]
 
-    #Get Web Trust
-    endPos = results[5].text.find('"', 2)
-    webTrust = results[5].text[:endPos]
+        #Get Web Trust
+        endPos = results[5].text.find('"', 2)
+        webTrust = results[5].text[:endPos]
+        if ":" in webTrust:
+            endPos = webTrust.find(":", 2)
+            webTrust = webTrust[:endPos]
+
+    except:
+        status = "Invalid URL"
+        webTrust = "Invalid URL"
 
     toReturn = ""
-    toReturn = "Sucuri \r\n Status: \r\n" + status + "\r\nWeb Trust: " + webTrust
+    toReturn = "Sucuri \r\n Status: \r\n" + status + " \r\nWeb Trust: " + webTrust + " \r\n"
 	
     return toReturn
  
+# Crawl Quttera
 def Quttera(url):
+
+    status = "N/A"
     driver = startBrowsing()
-    driver.get("http://quttera.com/sitescan/" + url)
-
     print("Scanning " + url + " on Quttera...")
-	
+
     try:
-        complete = WebDriverWait(driver, 60).until(
-            EC.visibility_of_element_located((By.XPATH, "//div[@id='ResultSummary']"))
-        )
-    except:
-        try:
-            malicious = driver.find_element_by_xpath("//div[@class='alert alert-m']").text
-        except:
-            result = "Unreachable"
-            return result
+        driver.get("https://quttera.com/detailed_report/" + url)
+    except TimeoutException:
+        print("Scan failed")
+        return status
 
-        if "Malicious" in malicious:
-            result = malicious
-        '''
-        else: 
-            result = "Unreachable"
-        '''
-    summary = driver.find_element_by_xpath("//div[@id='ResultSummary']")
-    scanResult = summary.find_elements_by_tag_name("h4")
+    results = driver.find_elements_by_xpath("//div[@class='panel-heading']")
+   
+    for result in results:
+        print(result.text)
+        if "No Malware" in result.text:
+            status = "Clean"
+            break
+        elif "Potentially Suspicious" in result.text:
+            status = "Potentially Suspicious"
+            break
+        elif "Malicious" in result.text:
+            status = "Malicious"
+            break
+        else:
+            status = "Unreachable"
+             
+    print(status)
 
-    status = str(scanResult[0].text)
+    return status
 
-    print (isinstance(status, str))
-    print (status)
-
-    if "No Malware Detected" in status:
-        result = "Clean"
-    elif "Potentially Suspicious" in status:
-        result = "Potentially Suspicious"
-    elif "Malicious" in status:
-        result = "Malicious"
-    else: 
-        result = ""
-
-    return result
-        
+# Crawl virustotal        
 def virustotal(url):
     driver = startBrowsing()
     driver.get("https://www.virustotal.com/en/#url")
 
     print("Scanning " + url + " on virustotal...")
-	
-    url_input = WebDriverWait(driver, 60).until(
-        EC.visibility_of_element_located((By.XPATH, "//input[@id='url']"))
-    )
 
+    # Wait until input box appears
+    try:	
+        url_input = WebDriverWait(driver, 60).until(
+            EC.visibility_of_element_located((By.XPATH, "//input[@id='url']"))
+        )
+    except:
+        return "N/A"
+
+    # enter url
     url_input = driver.find_element_by_xpath("//input[@id='url']")
     url_input.send_keys(url)
-    submit = driver.find_element_by_xpath("//button[@id='btn-scan-url']")
-    submit.click()
-    
-    print("submitted url!")
 
+
+    # Wait until scan button appears
     try:
-        reanalyze = WebDriverWait(driver, 300).until(
+        submit = WebDriverWait(driver, 20).until(
+            EC.visibility_of_element_located((By.XPATH, "//button[@id='btn-scan-url']"))
+        )
+        submit.click()
+    except:
+        return "N/A"
+    
+    # Wait until reanalyse button appears
+    try:
+        reanalyze = WebDriverWait(driver, 30).until(
             EC.visibility_of_element_located((By.XPATH, "//a[@id='btn-url-reanalyse']"))
         )
     except TimeoutException:
-        return ""
+        return "N/A"
     
     reanalyze = driver.find_element_by_xpath("//a[@id='btn-url-reanalyse']").get_attribute('href')
 
     driver.get(reanalyze)
 
-    print("Now reanalyzingggggg")
-    element = WebDriverWait(driver, 6000).until(
-        EC.visibility_of_element_located((By.TAG_NAME, "td"))
-    )
-    
+    print("Reanalyzing...")
+
+    # Wait until reanalysed results appear
+    try:
+        element = WebDriverWait(driver, 60).until(
+            EC.visibility_of_element_located((By.TAG_NAME, "td"))
+        )
+    except:
+        return "N/A"    
+
+    # Obtain results
     cells = driver.find_elements_by_tag_name("td")
     ratio = cells[3].text
     
     return ratio
-	
+
+# Scan md5 via virustotal api	
 def vtAPIscan(md5, key):
 
     result = OrderedDict()
     params = {'resource': md5, 'apikey': key}
     headers = {'Accept-Encoding': "gzip, deflate", "User-Agent": "gzip, My Python requests library example client or username"}
+
+    # Rescan the md5
     response = requests.post('https://www.virustotal.com/vtapi/v2/file/rescan', params=params)
+
+    # Retrieve the rescanned result
     response = requests.get('https://www.virustotal.com/vtapi/v2/file/report', params=params, headers=headers)
 
     print("Scanning " + md5 + " on virustotal...")
     countOftry = 1
+    toReturn = ""
+    antivirusList = ["Fortinet", "Kaspersky", "McAfee", "Symantec", "TrendMicro", "TrendMicro-Housecall"]
+
     while not response.text:
-        if countOftry<10:
+        if countOftry < 20:
             time.sleep(1)
             countOftry += 1
             print("Try virustotal file scan again")
             response = requests.get('https://www.virustotal.com/vtapi/v2/file/report', params=params, headers=headers)
         else:
-            return []
+            for antivirus in antivirusList:
+                toReturn += " \r\n\r\n" + antivirus + " Scan Result:\r\n File not found" + " \r\nUpdate: N/A"
+            return toReturn
 
-    print(response.text)
-    
-    antivirusList = ["Fortinet", "Kaspersky", "McAfee", "Symantec", "TrendMicro", "TrendMicro-Housecall"]
-
+    # Parse the returned json result
     if response.text:
-        json_response = response.json()
-            
-        result = getScanResults(json_response, antivirusList)
-	
-    toReturn = ""
-	
-    for antivirus in antivirusList:
-        if bool(result[antivirus])
-            toReturn += "\r\n\r\n" + antivirus + " Scan Result:\r\n " + result[antivirus] + "Update:\r\n " + result[antivirus + " Scan Date"]
-        else:
-            toReturn += "\r\n\r\n" + antivirus + " Scan Result:\r\n File not found\r\n" + "Update:\r\n N/A"
-    return toReturn
-
-def getResults(scanReportDict, antivirus):
-    for k,v in scanReportDict.items():
-       if k == antivirus:
-            for inK, inV in v.items():
-                if inK == "result" and inV != "None":
-                    scanResult = inV
-                    detected = True
-                elif inK == "update":
-                    scanUpdate = inV
-                elif inK == "detected" and inV == False:
-                    detected = False
-                    print("No Virus!!!!!")
-            if detected == False:
-                return "File not detected", scanUpdate
-            else:
-                return scanResult, scanUpdate
-    return "Not mentioend", "N/A" 
-
-def getScanResults(json_response, antivirusList):
-    d = OrderedDict()
-
-    if "scans" in json_response:
-        scanReportDict = json_response["scans"]
-        print("got results!!:D")
-
+        res = json.loads(response.text)
         for antivirus in antivirusList:
-            d[antivirus], d[antivirus + " Scan Date"] = getResults(scanReportDict, antivirus)
+            try:
+                s = res["scans"]
+                try:
+                    d = s[antivirus]
+                    if d["detected"] == True:
+                        result = d["result"]
+                        update = d["update"]
+                    elif d["detected"] == False:
+                        result = "Not Detected"
+                        update = d["update"]
+                except KeyError:
+                    result = "Not Mentioned"
+                    update = "N/A"
+            except KeyError:
+                 result = "File Not Found"
+                 update = "N/A"
+	
+            toReturn += " \r\n\r\n" + antivirus + " Scan Result:\r\n " + result + " \r\nUpdate:\r\n " + update
 
-    return d
-
+    print(toReturn)
+    return toReturn
 
 def introspection():
     modulesetup = {}

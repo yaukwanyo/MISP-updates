@@ -2,12 +2,20 @@ import json
 import requests
 from requests import HTTPError
 import base64
+from pyvirtualdisplay import Display
+from selenium import webdriver
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import TimeoutException
 import time
 import pymisp as pm
 from pymisp import PyMISP
 from pymisp import MISPEvent
 import argparse
 from collections import OrderedDict
+import socket
 
 misperrors = {'error': 'Error'}
 mispattributes = {'input': ['url', 'hostname', 'domain', "ip-src", "ip-dst", "md5"],
@@ -20,8 +28,9 @@ moduleinfo = {'version': '1.0', 'author': 'SEC21',
               'module-type': ['expansion']}
 
 # config fields that your code expects from the site admin
-moduleconfig = ["VTapikey", "MISPurl", "MISPkey"]
-			  
+moduleconfig = ["MISPurl", "MISPkey"]
+
+
 def init(url,key):
     return PyMISP(url,key, False, 'json')
 
@@ -31,15 +40,15 @@ def handler(q=False):
         return False
 	
     q = json.loads(q)
-
+	
     MISPurl = q["config"]["MISPurl"]
-    MISPkey = q["config"]["MISPkey"] 
+    MISPkey = q["config"]["MISPkey"]  
 
     r = {"results": []}
 
     print (q)
 	
-	# If the attribute is one of the following types, scan port and save the results as an new attribute
+    # If the attribute belongs to any of the following types, scan and save results as an new attribute
     if "ip-src" in q:
         ioc = q["ip-src"]
         ioc_type = "ip-src"
@@ -68,6 +77,11 @@ def handler(q=False):
         url = cleanURL(q["hostname"])
         comment = scanURL(ioc) 
         r["results"].append({'types': [ioc_type], "values": [url], "comment": comment})
+		
+    if 'md5' in q:
+        ioc = q["md5"]
+        ioc_type = "md5"
+        r["results"] += vtAPIscan(q['md5'], key)
 
     if "url" in q:
         ioc = q["url"]
@@ -87,14 +101,19 @@ def handler(q=False):
 
     return r
 
-
 def scanURL(ioc):
-    port80 = portScan(ioc, 80)
-    port443 = portScan(ioc, 443)
-
-    toReturn = " \r\nPort Status \r\nPort 80: \n" + port80 + " \r\nPort 443: \n" + port443 
+    sucuri = Sucuri(ioc)
+	
+    toReturn = " \r\n" + sucuri 
  
     return toReturn
+
+# Setup browser
+def startBrowsing():
+    display = Display(visible=0, size=(800,600))
+    display.start()
+    driver = webdriver.Chrome()
+    return driver
 
 	
 def delete_mispAttribute(q, ioc, MISPurl, MISPkey):
@@ -131,7 +150,7 @@ def delete_mispAttribute(q, ioc, MISPurl, MISPkey):
 
     return ""
 
-# Remove possible symbols in url
+# Remove possible symbols in URL
 def cleanURL(url):
 	
     url = str(url)
@@ -140,22 +159,43 @@ def cleanURL(url):
 
     return url
 
-# Scan ports using yougetsignal's api
-def portScan(url, portNo):
-    params = {"remoteAddress": url, "portNumber": portNo}
-    r=requests.post("https://ports.yougetsignal.com/check-port.php", params)
-    page = r.text
-    if "/img/flag_green.gif" in page:
-        status = "Open"
-    elif "/img/flag_red.gif" in page:
-        status = "Close"
-    else:
+def Sucuri(url):
+
+    driver = startBrowsing()
+    driver.get("https://sitecheck.sucuri.net/results/" + url)
+
+    print("Scanning " + url + " on Sucuri...")
+    results = driver.find_elements_by_tag_name("td")
+
+    try:
+        #Get status
+        endPos = results[3].text.find('"', 2)
+        status = results[3].text[:endPos]
+
+        #Get Web Trust
+        endPos = results[5].text.find('"', 2)
+        webTrust = results[5].text[:endPos]
+        if ":" in webTrust:
+            endPos = webTrust.find(":", 2)
+            webTrust = webTrust[:endPos]
+
+    except:
         status = "Invalid URL"
-    return status	
+        webTrust = "Invalid URL"
+
+    toReturn = ""
+    toReturn = "Sucuri \r\n Status: \r\n" + status + " \r\nWeb Trust: " + webTrust + " \r\n"
+	
+    return toReturn
+	
+
+
+	
 	
 def introspection():
     return mispattributes
 
 
 def version():
+    #moduleinfo['config'] = moduleconfig
     return moduleinfo

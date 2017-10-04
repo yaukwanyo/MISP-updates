@@ -2,16 +2,24 @@ import json
 import requests
 from requests import HTTPError
 import base64
+from pyvirtualdisplay import Display
+from selenium import webdriver
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import TimeoutException
 import time
 import pymisp as pm
 from pymisp import PyMISP
 from pymisp import MISPEvent
 import argparse
 from collections import OrderedDict
+import socket
 
 misperrors = {'error': 'Error'}
-mispattributes = {'input': ['url', 'hostname', 'domain', "ip-src", "ip-dst", "md5"],
-                  'output': ['url', 'hostname', 'domain', 'ip-src', 'ip-dst', 'md5']
+mispattributes = {'input': ['url', 'hostname', 'domain', "ip-src", "ip-dst"],
+                  'output': ['url', 'hostname', 'domain', 'ip-src', 'ip-dst']
                   }
 
 # possible module-types: 'expansion', 'hover' or both
@@ -20,26 +28,30 @@ moduleinfo = {'version': '1.0', 'author': 'SEC21',
               'module-type': ['expansion']}
 
 # config fields that your code expects from the site admin
-moduleconfig = ["VTapikey", "MISPurl", "MISPkey"]
-			  
+moduleconfig = ["MISPurl", "MISPkey"]
+
 def init(url,key):
     return PyMISP(url,key, False, 'json')
 
 def handler(q=False):
     global limit
+	
+    # Just in case we have no data
     if q is False:
         return False
-	
+
+    # Load up that JSON
     q = json.loads(q)
 
     MISPurl = q["config"]["MISPurl"]
     MISPkey = q["config"]["MISPkey"] 
 
+    # The return value
     r = {"results": []}
 
     print (q)
 	
-	# If the attribute is one of the following types, scan port and save the results as an new attribute
+    # If the attribute belongs to any of the following types, scan and save results as an new attribute
     if "ip-src" in q:
         ioc = q["ip-src"]
         ioc_type = "ip-src"
@@ -81,22 +93,92 @@ def handler(q=False):
         if res not in uniq:
             uniq.append(res)
     r["results"] = uniq
-  
+
     # Remove the original attribute
     delete_mispAttribute(q,ioc, MISPurl, MISPkey)
 
     return r
 
-
 def scanURL(ioc):
-    port80 = portScan(ioc, 80)
-    port443 = portScan(ioc, 443)
-
-    toReturn = " \r\nPort Status \r\nPort 80: \n" + port80 + " \r\nPort 443: \n" + port443 
- 
+    vt = virustotal(ioc)
+	
+    toReturn = "Virustotal \r\nDetection Ratio: " + vt 
+	
     return toReturn
 
+# Setup the browser
+def startBrowsing():
+    display = Display(visible=0, size=(800,600))
+    display.start()
+    driver = webdriver.Chrome()
+    return driver		
+
 	
+# Get reanalyzed results from virustotal.com (API does not support the "Reanalyze" function)
+def virustotal(url):
+    driver = startBrowsing()
+    driver.get("https://www.virustotal.com/en/#url")
+
+    print("Scanning " + url + " on virustotal...")
+
+    # Wait until input box appears
+    try:
+        url_input = WebDriverWait(driver, 60).until(
+            EC.visibility_of_element_located((By.XPATH, "//input[@id='url']"))
+        )
+    except:
+        return "N/A"
+
+    # enter url
+    url_input = driver.find_element_by_xpath("//input[@id='url']")
+    url_input.send_keys(url)
+	
+    # Wait until scan button appears
+    try:
+        submit = WebDriverWait(driver, 20).until(
+            EC.visibility_of_element_located((By.XPATH, "//button[@id='btn-scan-url']"))
+        )
+        submit.click()
+    except:
+        return "N/A"
+    
+    # Wait until reanalyse button appears
+    try:
+        reanalyze = WebDriverWait(driver, 30).until(
+            EC.visibility_of_element_located((By.XPATH, "//a[@id='btn-url-reanalyse']"))
+        )
+    except TimeoutException:
+        return ""
+    
+    reanalyze = driver.find_element_by_xpath("//a[@id='btn-url-reanalyse']").get_attribute('href')
+
+    driver.get(reanalyze)
+
+    print("Reanalyzing...")
+
+    # Wait until reanalysed results appear
+    try:
+        element = WebDriverWait(driver, 60).until(
+            EC.visibility_of_element_located((By.TAG_NAME, "td"))
+        )
+    except:
+        return "N/A" 
+   
+    # Obtain results
+    cells = driver.find_elements_by_tag_name("td")
+    ratio = cells[3].text
+	
+    return ratio
+	
+# Remove possible symbols in URL
+def cleanURL(url):
+	
+    url = str(url)
+    url = url.replace("[","")
+    url = url.replace("]","")
+
+    return url
+
 def delete_mispAttribute(q, ioc, MISPurl, MISPkey):
 
     myMISPurl = MISPurl
@@ -130,28 +212,7 @@ def delete_mispAttribute(q, ioc, MISPurl, MISPkey):
                     misp.delete_attribute(v)
 
     return ""
-
-# Remove possible symbols in url
-def cleanURL(url):
 	
-    url = str(url)
-    url = url.replace("[","")
-    url = url.replace("]","")
-
-    return url
-
-# Scan ports using yougetsignal's api
-def portScan(url, portNo):
-    params = {"remoteAddress": url, "portNumber": portNo}
-    r=requests.post("https://ports.yougetsignal.com/check-port.php", params)
-    page = r.text
-    if "/img/flag_green.gif" in page:
-        status = "Open"
-    elif "/img/flag_red.gif" in page:
-        status = "Close"
-    else:
-        status = "Invalid URL"
-    return status	
 	
 def introspection():
     return mispattributes
